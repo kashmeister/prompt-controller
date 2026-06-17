@@ -29,8 +29,9 @@ only reacts to the approval menu actually visible in the terminal stream.
 3. It scans the output for an approval prompt. When one appears it:
    - writes a small JSON state file to `/tmp`,
    - posts a macOS notification, and
-   - activates (focuses) your terminal window — un-minimizing it from the Dock
-     if it was minimized, so a prompt always brings the window back on screen.
+   - raises and focuses **only the agent's terminal window** — un-minimizing it
+     from the Dock if needed — without dragging your other terminal windows
+     forward (it marks that one window and activates the app only when needed).
 4. While the prompt is unanswered and the terminal isn't focused, it keeps
    nudging (re-focus + re-notify) so you can't miss it.
 5. When you answer — or the agent resumes working — it clears the state and stops.
@@ -99,6 +100,10 @@ is included at [`karabiner/prompt-controller-karabiner.json`](karabiner/prompt-c
   [superwhisper](https://superwhisper.com)) so you can dictate a reply.
 - **Hold D-pad Right** → send `2`, selecting *"Yes, allow for this session"* in
   the approval menu.
+- **Hold D-pad Down** → `⌘M`, minimizing the agent's window to the Dock when
+  you're done reviewing (a prompt un-minimizes it again automatically).
+
+All holds use a 500ms threshold; a quick tap still sends the normal key.
 
 To install it:
 
@@ -131,9 +136,15 @@ Each flag also has an environment-variable form, prefixed per CLI —
 Defaults live as constants at the top of each wrapper:
 
 ```python
-DEFAULT_AUTO_FOCUS = True      # focus the terminal when a prompt appears
-DEFAULT_RESTORE_FOCUS = False  # restore the previously focused app afterward
+DEFAULT_AUTO_FOCUS = True       # focus the terminal when a prompt appears
+DEFAULT_RESTORE_FOCUS = False   # "unfocus mode": hand focus back afterward
+RESTORE_FOCUS_DELAY_SECONDS = 5 # in unfocus mode, review window before unfocusing
 ```
+
+With `DEFAULT_RESTORE_FOCUS = True` ("unfocus mode"), after you answer a prompt
+the terminal stays focused for `RESTORE_FOCUS_DELAY_SECONDS` — a review window —
+then focus returns to the app you were in. A new prompt cancels a pending
+unfocus. Set the delay to `0` to hand focus back immediately.
 
 Sticky-reminder cadence (same constants in both wrappers): while a prompt is
 unanswered and the terminal isn't frontmost, the wrapper re-pulls it forward
