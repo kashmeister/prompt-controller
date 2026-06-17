@@ -29,7 +29,8 @@ only reacts to the approval menu actually visible in the terminal stream.
 3. It scans the output for an approval prompt. When one appears it:
    - writes a small JSON state file to `/tmp`,
    - posts a macOS notification, and
-   - activates (focuses) your terminal window.
+   - activates (focuses) your terminal window — un-minimizing it from the Dock
+     if it was minimized, so a prompt always brings the window back on screen.
 4. While the prompt is unanswered and the terminal isn't focused, it keeps
    nudging (re-focus + re-notify) so you can't miss it.
 5. When you answer — or the agent resumes working — it clears the state and stops.
