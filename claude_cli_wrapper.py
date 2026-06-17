@@ -185,11 +185,34 @@ def activate_app(app_name: str) -> None:
         pass
 
 
+def unminimize_windows(app_name: str) -> None:
+    """Best-effort: pull any Dock-minimized windows of the app back onto screen.
+
+    Used when a prompt needs attention so a minimized terminal is actually
+    restored, not just made the active app behind the scenes. Relies on the same
+    Accessibility permission the wrapper already uses to set frontmost.
+    """
+    if not app_name:
+        return
+    safe_name = escape_applescript(app_name)
+    run_osascript(
+        f'tell application "System Events" to tell process "{safe_name}"\n'
+        f'  repeat with w in windows\n'
+        f'    try\n'
+        f'      if value of attribute "AXMinimized" of w is true then '
+        f'set value of attribute "AXMinimized" of w to false\n'
+        f'    end try\n'
+        f'  end repeat\n'
+        f'end tell'
+    )
+
+
 def activate_terminal_window(app_name: Optional[str], tty_name: Optional[str]) -> None:
     if not app_name:
         return
 
     if not tty_name:
+        unminimize_windows(app_name)
         activate_app(app_name)
         return
 
@@ -205,6 +228,7 @@ tell application "Terminal"
       try
         if tty of t is "{safe_tty}" then
           set selected of t to true
+          set miniaturized of w to false
           set index of w to 1
           return "ok"
         end if
@@ -226,6 +250,9 @@ tell application "iTerm2"
       repeat with s in sessions of t
         try
           if tty of s is "{safe_tty}" then
+            try
+              set miniaturized of w to false
+            end try
             tell w to set current tab to t
             tell t to set current session to s
             return "ok"
@@ -240,6 +267,7 @@ end tell
         if result == "ok":
             return
 
+    unminimize_windows(app_name)
     activate_app(app_name)
 
 
