@@ -27,6 +27,11 @@ DEFAULT_STATE_FILE = Path("/tmp/claude-cli-prompt-state.json")
 DEFAULT_DEBUG_LOG = Path("/tmp/claude-cli-wrapper.log")
 DEFAULT_AUTO_FOCUS = True
 DEFAULT_RESTORE_FOCUS = False
+# Unfocus mode: when DEFAULT_RESTORE_FOCUS is True, how long (seconds) to keep
+# the terminal focused after a prompt resolves before handing focus back to the
+# app you were in — a review window so the agent's action doesn't vanish
+# instantly. Set 0 to restore focus immediately. Tune to taste.
+RESTORE_FOCUS_DELAY_SECONDS = 5.0
 ROLLING_TEXT_LIMIT = 12000
 PROMPT_SCAN_TAIL_CHARS = 2200
 PROMPT_ENTER_STABILITY_SECONDS = 0.45
@@ -216,55 +221,104 @@ def activate_terminal_window(app_name: Optional[str], tty_name: Optional[str]) -
         activate_app(app_name)
         return
 
-    safe_app = escape_applescript(app_name)
     safe_tty = escape_applescript(tty_name)
 
+    # Raise and focus ONLY the matched window. App-level `activate` brings every
+    # window of the app forward; instead we find the window by tty, match it in
+    # System Events by on-screen position (unique per window; the tty is not
+    # visible to System Events), AXRaise it + mark it main, then activate the app
+    # via NSRunningApplication WITHOUT the all-windows option — the same
+    # single-window behaviour as clicking that one window.
     if app_name == "Terminal":
         script = f'''
+use framework "AppKit"
+use scripting additions
+set px to missing value
+set py to missing value
 tell application "Terminal"
-  activate
   repeat with w in windows
     repeat with t in tabs of w
       try
         if tty of t is "{safe_tty}" then
           set selected of t to true
           set miniaturized of w to false
-          set index of w to 1
-          return "ok"
+          set b to bounds of w
+          set px to item 1 of b
+          set py to item 2 of b
+          exit repeat
         end if
       end try
     end repeat
+    if px is not missing value then exit repeat
   end repeat
 end tell
+if px is missing value then return "notfound"
+tell application "System Events"
+  set wasFront to (frontmost of process "Terminal")
+  tell process "Terminal"
+    try
+      set theWin to (first window whose position is {{px, py}})
+      set value of attribute "AXMain" of theWin to true
+      perform action "AXRaise" of theWin
+    end try
+  end tell
+end tell
+if not wasFront then
+  set theApps to current application's NSRunningApplication's runningApplicationsWithBundleIdentifier:"com.apple.Terminal"
+  if (count of theApps) > 0 then (item 1 of theApps)'s activateWithOptions:2
+end if
+return "ok"
 '''
-        result = run_osascript(script)
-        if result == "ok":
+        if run_osascript(script) == "ok":
             return
 
     if app_name == "iTerm2":
         script = f'''
+use framework "AppKit"
+use scripting additions
+set px to missing value
+set py to missing value
 tell application "iTerm2"
-  activate
   repeat with w in windows
     repeat with t in tabs of w
       repeat with s in sessions of t
         try
           if tty of s is "{safe_tty}" then
+            tell w to set current tab to t
+            tell t to set current session to s
             try
               set miniaturized of w to false
             end try
-            tell w to set current tab to t
-            tell t to set current session to s
-            return "ok"
+            set b to bounds of w
+            set px to item 1 of b
+            set py to item 2 of b
+            exit repeat
           end if
         end try
       end repeat
+      if px is not missing value then exit repeat
     end repeat
+    if px is not missing value then exit repeat
   end repeat
 end tell
+if px is missing value then return "notfound"
+tell application "System Events"
+  set wasFront to (frontmost of process "iTerm2")
+  tell process "iTerm2"
+    try
+      set theWin to (first window whose position is {{px, py}})
+      set value of attribute "AXMain" of theWin to true
+      perform action "AXRaise" of theWin
+    end try
+  end tell
+end tell
+if not wasFront then
+  set theApps to current application's NSRunningApplication's runningApplicationsWithBundleIdentifier:"com.googlecode.iterm2"
+  if (count of theApps) > 0 then (item 1 of theApps)'s activateWithOptions:2
+end if
+return "ok"
 '''
-        result = run_osascript(script)
-        if result == "ok":
+        if run_osascript(script) == "ok":
             return
 
     unminimize_windows(app_name)
@@ -421,6 +475,7 @@ class PromptState:
         self.debug_log = debug_log
         self.active = False
         self.saved_frontmost_app = None
+        self.restore_at = 0.0
         self.terminal_app = terminal_app or current_terminal_app_name() or current_frontmost_app()
         self.terminal_tty = None
         self.last_excerpt = None
@@ -476,9 +531,13 @@ class PromptState:
             return
 
         self.active = True
+        self.restore_at = 0.0  # a new prompt cancels any pending unfocus
         self.last_excerpt = excerpt
         frontmost = current_frontmost_app()
-        self.saved_frontmost_app = frontmost if frontmost != self.terminal_app else None
+        # Only capture a real previous app; if the terminal is already frontmost
+        # (e.g. rapid back-to-back prompts) keep the app saved from the first one.
+        if frontmost and frontmost != self.terminal_app:
+            self.saved_frontmost_app = frontmost
         self.write_state(True, excerpt)
         self.debug(f"PROMPT_ENTER terminalApp={self.terminal_app!r} savedFrontmostApp={self.saved_frontmost_app!r}")
 
@@ -499,9 +558,15 @@ class PromptState:
         self.clear_state()
 
         if self.restore_enabled and self.saved_frontmost_app and self.saved_frontmost_app != self.terminal_app:
-            activate_app(self.saved_frontmost_app)
+            if RESTORE_FOCUS_DELAY_SECONDS > 0:
+                # Stay focused for the review window; tick() unfocuses later.
+                self.restore_at = time.monotonic() + RESTORE_FOCUS_DELAY_SECONDS
+            else:
+                activate_app(self.saved_frontmost_app)
+                self.saved_frontmost_app = None
+        else:
+            self.saved_frontmost_app = None
 
-        self.saved_frontmost_app = None
         self.last_excerpt = None
         self.last_prompt_seen_at = 0.0
         self.pending_resolution_until = 0.0
@@ -525,9 +590,22 @@ class PromptState:
         # Called every main-loop iteration, even when no output arrives, so a
         # static permission prompt still gets re-focused and re-notified.
         self.maybe_enter_pending_prompt()
+        self.perform_pending_restore()
         if not self.active:
             return
         self.remind(time.monotonic())
+
+    def perform_pending_restore(self) -> None:
+        # Unfocus mode: once the review delay elapses (and no new prompt is up),
+        # hand focus back to the app that was frontmost before the prompt.
+        if self.active or not self.restore_at:
+            return
+        if time.monotonic() < self.restore_at:
+            return
+        if self.saved_frontmost_app and self.saved_frontmost_app != self.terminal_app:
+            activate_app(self.saved_frontmost_app)
+        self.saved_frontmost_app = None
+        self.restore_at = 0.0
 
     def remind(self, now: float) -> None:
         if not self.activate_enabled or not self.terminal_app:
