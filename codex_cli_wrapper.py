@@ -357,29 +357,57 @@ def title_indicates_prompt(title: str) -> bool:
 
 
 def prompt_visible(text: str) -> bool:
+    """Detect that Codex is blocked on an interactive approval/selection prompt.
+
+    Like Claude Code, current Codex renders these menus by positioning each word
+    with cursor escapes rather than literal spaces, so after ANSI stripping the
+    words run together and the option rows lose their newlines (e.g.
+    "1. Yes, proceed (y)\n2. No ..." -> "1.yes,proceed(y)2.no..."). We therefore
+    match on a whitespace-insensitive form, which is robust to that rendering and
+    to wording drift.
+
+    This complements the "[!] Action Required" terminal-title marker
+    (title_indicates_prompt): the title covers command/patch approvals, while
+    this text match also catches the startup "Do you trust the contents of this
+    directory?" prompt, which appears before Codex emits any terminal title.
+    """
     if not text:
         return False
 
-    has_choice1 = "Yes (1)" in text or re.search(r"(^|\n)\s*1\.\s+Yes\b", text) is not None
-    has_choice2 = "Yes, (2)" in text or re.search(r"(^|\n)\s*2\.\s+Yes\b", text) is not None
-    has_choice3 = (
-        "No (3)" in text
-        or "No, (3)" in text
-        or re.search(r"(^|\n)\s*3\.\s+No\b", text) is not None
+    compact = re.sub(r"\s+", "", text.lower())
+
+    # Interactive footer ("Press enter to confirm or esc to cancel"). Distinct
+    # from the busy-state hint "esc to interrupt" -> "esctointerrupt".
+    interactive_footer = "esctocancel" in compact
+
+    # A numbered yes/no menu: "1. Yes ..." plus a "No" option (2 or 3).
+    numbered_yes_no = ("1.yes" in compact) and ("2.no" in compact or "3.no" in compact)
+
+    ask_phrase = (
+        "wouldyouliketo" in compact       # would you like to run/apply the following ...
+        or "doyoutrust" in compact        # trust the contents of this directory
+        or "doyouwantto" in compact
+        or "allowcodexto" in compact
     )
-    has_choice4 = "fill-in (4)" in text or re.search(r"(^|\n)\s*4\.", text) is not None
-    has_codex_negative = (
-        "don't ask again" in text
-        or "tell Codex what to do differently" in text
-        or "No, and tell Codex what to do differently" in text
-        or "Yes, and don't ask again" in text
+
+    yes_option = (
+        "1.yes" in compact
+        or "yes,proceed" in compact
+        or "yes(1)" in compact            # legacy "Yes (1)" rendering
+    )
+
+    codex_negative = (
+        "tellcodexwhatto" in compact      # No, and tell Codex what to do differently
+        or "no,andtellcodex" in compact
+        or "don'taskagain" in compact
+        or "dontaskagain" in compact
     )
 
     return (
-        (has_choice1 and has_choice3)
-        or (has_choice1 and has_choice2 and has_choice3)
-        or (has_choice1 and has_choice3 and has_choice4)
-        or has_codex_negative
+        numbered_yes_no
+        or codex_negative
+        or (ask_phrase and yes_option)
+        or (interactive_footer and (yes_option or ask_phrase))
     )
 
 

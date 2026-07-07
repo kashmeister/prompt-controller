@@ -179,7 +179,16 @@ when no prompt is active, and stale state is cleared on startup):
 ## Detection details
 
 The Codex wrapper keys off Codex's `[!] Action Required` title marker plus its
-numbered approval menu.
+approval menu in the terminal stream. The title marker covers command and patch
+approvals; the menu matcher also catches the startup *"Do you trust the contents
+of this folder?"* prompt, which appears before Codex emits any terminal title.
+Like Claude Code (below), current Codex positions each menu word with
+cursor-movement escapes instead of literal spaces, so the matcher works on a
+whitespace-insensitive form rather than fixed strings — robust to that rendering
+and to wording drift. It recognizes numbered `1. Yes` / `2.`–`3. No` menus, the
+`Would you like to run…` / `Do you trust…` questions, the `No, and tell Codex
+what to do differently` option, and the `Press enter to confirm · esc to cancel`
+footer.
 
 The Claude wrapper matches Claude Code's approval menu in the terminal stream.
 Current Claude Code positions each word with cursor-movement escapes instead of
