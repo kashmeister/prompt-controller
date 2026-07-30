@@ -25,7 +25,8 @@ only reacts to the approval menu actually visible in the terminal stream.
 ## How it works
 
 1. You launch the agent through the wrapper (`claude-cli` instead of `claude`).
-2. The wrapper spawns the real CLI on a PTY and forwards all I/O unchanged.
+2. The wrapper spawns the real CLI on a PTY — as that PTY's *controlling* terminal,
+   so window resizes reach it — and forwards all I/O unchanged.
 3. It scans the output for an approval prompt. When one appears it:
    - writes a small JSON state file to `/tmp`,
    - posts a macOS notification, and
@@ -40,6 +41,11 @@ only reacts to the approval menu actually visible in the terminal stream.
 
 **Requirements:** macOS, Python 3, and the CLI you want to wrap (`claude` and/or
 `codex`) on your `PATH`.
+
+**Verified against:** Claude Code **2.1.173** and codex-cli **0.146.0** (macOS 15,
+Apple Terminal). Detection reads what the CLI paints, so a release can change it —
+after updating either CLI, run `python3 tests/selftest.py` (see
+[Checking detection after a CLI update](#checking-detection-after-a-cli-update)).
 
 ```sh
 git clone https://github.com/<you>/prompt-controller.git
@@ -70,8 +76,18 @@ ln -s "$PWD/codex-cli"  /usr/local/bin/codex-cli
 ## Controller setup (optional)
 
 prompt-controller reacts to ordinary keystrokes, so anything that can send arrow
-keys, Enter, and Esc can drive the prompts. A tiny Bluetooth game controller
-makes it possible to approve from across the room. The tested/recommended one:
+keys, Enter, and Esc can drive the prompts. Both CLIs still take the plain keys —
+verified on Claude Code 2.1.173 and codex-cli 0.146.0:
+
+| Key | Claude Code | Codex |
+| --- | --- | --- |
+| `↑` / `↓` | moves the highlight | moves the highlight |
+| `Enter` (plain `\r`) | confirms the highlighted option | confirms the highlighted option |
+| `Esc` | rejects the tool call | cancels the command |
+| `1`–`3` | selects that option instantly | selects that option instantly |
+
+A tiny Bluetooth game controller makes it possible to approve from across the
+room. The tested/recommended one:
 
 [Bluetooth mini game controller (Amazon)](https://www.amazon.com/Controller-Android-Portable-Wireless-Scrolling-Smartphone/dp/B0FLK6TP38/)
 
@@ -98,8 +114,9 @@ is included at [`karabiner/prompt-controller-karabiner.json`](karabiner/prompt-c
 
 - **Hold Esc** → trigger voice input ([Wispr Flow](https://wisprflow.ai) /
   [superwhisper](https://superwhisper.com)) so you can dictate a reply.
-- **Hold D-pad Right** → send `2`, selecting *"Yes, allow for this session"* in
-  the approval menu.
+- **Hold D-pad Right** → send `2`, selecting the *second* option in the approval
+  menu. **Know what you are granting** — see the scope table below; option 2 is no
+  longer always "just for this session".
 - **Hold D-pad Down** → `⌘M`, minimizing the agent's window to the Dock when
   you're done reviewing (a prompt un-minimizes it again automatically).
 
@@ -114,6 +131,43 @@ To install it:
 3. **Replace the `vendor_id` / `product_id`** in the JSON with your own
    controller's IDs (find them in *Karabiner-EventViewer*). The bundled values
    match one specific device.
+
+### What option `2` actually grants
+
+Number keys select immediately (no Enter), so a hold-to-send macro commits the
+choice without you reading the screen. Option 2's scope depends on the prompt:
+
+| Prompt | Option 2 | Scope |
+| --- | --- | --- |
+| Claude edit/write | *Yes, allow all edits during this session* | this session only |
+| Claude Bash | *Yes, and always allow access to `<dir>` from this project* | outlives the session (Claude's own wording: "always … from this project") |
+| Codex command | *Yes, and don't ask again for commands that start with `<cmd>`* | **permanent and global** |
+
+Codex's option 2 appends a `prefix_rule(...)` line to `~/.codex/rules/default.rules`,
+which applies in *every* directory and survives restarts — it is not session state
+and not project state. The rule is matched on the exact command prefix, so it is
+narrow, but it never expires. Prune that file to revoke.
+
+If you'd rather the hold gesture never widen permissions, **remap it to `1`**
+("Yes" / "Yes, proceed") — that approves the single action and writes nothing.
+
+### Session-only "allow all"
+
+Claude has one built in: option 2 on an edit prompt, or `shift+tab` to cycle to
+`⏵⏵ accept edits on`. It lasts for the session and leaves no trace on disk.
+
+Codex has no per-session equivalent — both its option 2 and `/permissions` →
+*Approve for me* persist (the latter writes `approvals_reviewer` to
+`~/.codex/config.toml`). The only session-scoped route is launch flags, which
+write nothing:
+
+```sh
+./codex-cli -- -a never -s workspace-write
+```
+
+That approves everything the sandbox permits for that session only, still blocking
+writes outside the workspace and network access. The trade-off is that it removes
+approval prompts entirely — so prompt-controller has nothing to catch that session.
 
 ## Configuration
 
@@ -179,10 +233,12 @@ when no prompt is active, and stale state is cleared on startup):
 ## Detection details
 
 The Codex wrapper keys off Codex's `[!] Action Required` title marker plus its
-approval menu in the terminal stream. The title marker covers command and patch
-approvals; the menu matcher also catches the startup *"Do you trust the contents
-of this folder?"* prompt, which appears before Codex emits any terminal title.
-Like Claude Code (below), current Codex positions each menu word with
+approval menu in the terminal stream. **Both signals count; neither suppresses the
+other.** The title marker covers command and patch approvals, but Codex sets no
+marker for its other blocking menus — the startup *"Do you trust the contents of
+this folder?"* prompt, and model-migration / onboarding choices — so the menu
+matcher is what catches those. Like Claude Code (below), current Codex positions
+each menu word with
 cursor-movement escapes instead of literal spaces, so the matcher works on a
 whitespace-insensitive form rather than fixed strings — robust to that rendering
 and to wording drift. It recognizes numbered `1. Yes` / `2.`–`3. No` menus, the
@@ -211,6 +267,29 @@ apps. (The terminal title alone can't tell a blocking prompt from a finished tur
 used only as a *busy* signal, to instantly clear the reminder once Claude resumes
 after you answer.)
 
+Detection is **level-triggered, not just edge-triggered**. An approval menu is
+normally caught on the chunk of output that paints it, but a prompt the CLI has
+finished drawing emits nothing more — so if that one chunk is missed, there is no
+second chance. Both wrappers therefore re-examine what is still on screen once
+output goes quiet, and enter from that. This is what keeps a static prompt from
+being lost when it straddles a read boundary or lands in the same repaint as a
+spinner update.
+
+## Checking detection after a CLI update
+
+Because detection watches what the CLI paints, a Codex or Claude Code release can
+change it out from under the wrapper. A replay test covers both — real captured
+approval menus that must fire, and ordinary working output that must stay quiet:
+
+```sh
+python3 tests/selftest.py
+```
+
+It drives the same `scan_output()` the live wrappers use, against the fixtures in
+`tests/fixtures/`, so it fails the way the wrapper would. To cover a new prompt
+after an update, record a session's raw PTY output to a file, drop it in
+`tests/fixtures/`, and add it to `CASES` in `tests/selftest.py`.
+
 ## Troubleshooting
 
 **A prompt is visible but the window doesn't focus**
@@ -225,6 +304,14 @@ after you answer.)
 - That's debug output reaching the terminal. The current wrapper sends `--debug`
   only to a log file, so updating to the latest version stops it.
 
+**The TUI drifts out of alignment after resizing the window** — wrapping breaks,
+typed characters appear in the wrong columns, the current output line is hard to
+find
+- Fixed in the current version. The wrapper gives the CLI the pseudo-terminal as
+  its *controlling* terminal, which is what lets the kernel deliver `SIGWINCH` on
+  resize; without it the CLI kept rendering at the size it saw at launch. Restart
+  the wrapper after updating.
+
 ## Files
 
 ```text
@@ -233,6 +320,9 @@ prompt-controller/
   claude_cli_wrapper.py
   codex-cli                 # launcher for the Codex wrapper
   codex_cli_wrapper.py
+  tests/
+    selftest.py             # replays recorded prompts through detection
+    fixtures/               # captured Codex / Claude Code terminal streams
   karabiner/
     prompt-controller-karabiner.json
   controller-mapping.png    # button-mapping illustration (in the README)
