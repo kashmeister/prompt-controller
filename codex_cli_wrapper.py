@@ -35,6 +35,11 @@ RESTORE_FOCUS_DELAY_SECONDS = 5.0
 ROLLING_TEXT_LIMIT = 12000
 PROMPT_SCAN_TAIL_CHARS = 2200
 PROMPT_ENTER_STABILITY_SECONDS = 0.2
+# How long output must stay quiet before the on-screen text is re-examined for a
+# prompt that was never entered. Entering is otherwise edge-triggered on the chunk
+# that paints the menu, and a prompt Codex has stopped repainting gets no second
+# chance; this is that second chance. See maybe_enter_idle_prompt.
+PROMPT_IDLE_RESCAN_SECONDS = 1.0
 PROMPT_EXIT_GRACE_SECONDS = 0.75
 PROMPT_RESOLUTION_TIMEOUT_SECONDS = 4.0
 PROMPT_REACTIVATE_INTERVAL_SECONDS = 2.0
@@ -59,7 +64,13 @@ ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 OSC_ESCAPE_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)")
 CSI_PRIVATE_RE = re.compile(r"\x1b[PX^_].*?\x1b\\", re.DOTALL)
 OSC_TITLE_RE = re.compile(r"\x1b\](?:0|1|2);(.*?)(?:\x07|\x1b\\)")
-ACTION_REQUIRED_TITLE_RE = re.compile(r"\[\s*[!.]\s*\](?:\s+Action Required\s+\|)?")
+# Codex prefixes the terminal title with "[ ! ] Action Required | <dir>" (the
+# bracket glyph alternates with "[ . ]" as it blinks) while it waits on a command
+# or patch approval. Anchored, so an ordinary title can't match by accident.
+ACTION_REQUIRED_TITLE_RE = re.compile(r"^\s*\[\s*[!.]\s*\](?:\s+Action Required\s+\|)?")
+# Codex animates a braille spinner glyph (U+2800-U+28FF) at the front of the same
+# title while it is working, and drops it when it stops.
+BRAILLE_SPINNER_RANGE = (0x2800, 0x28FF)
 
 
 def parse_args() -> argparse.Namespace:
@@ -339,6 +350,44 @@ def set_pty_size(fd: int, size) -> None:
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", *size))
 
 
+def adopt_controlling_tty() -> None:
+    """Child-side setup: new session, then adopt the pty as controlling terminal.
+
+    setsid() alone leaves the child with *no* controlling terminal, so the pty has
+    no foreground process group for the kernel to signal -- and SIGWINCH is never
+    delivered on resize. The CLI then keeps rendering at whatever size it saw at
+    launch: line wrapping breaks and the input line is drawn in the wrong columns.
+    TIOCSCTTY is what makes the resize signal reach it (and gives it a working
+    /dev/tty).
+    """
+    os.setsid()
+    try:
+        # preexec_fn runs after stdin/stdout/stderr are dup2'd, so fd 0 is the pty.
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+    except OSError:
+        pass
+
+
+def write_all(fd: int, data: bytes) -> None:
+    """Write every byte of data, retrying short and interrupted writes.
+
+    A write to the terminal can come back having transferred only part of the
+    buffer when a signal (SIGWINCH while the window is being dragged) lands
+    mid-write, and Python does not retry a *partial* write. Dropping the rest
+    would tear an escape sequence in half and corrupt the TUI, so loop.
+    """
+    view = memoryview(data)
+    while view:
+        try:
+            written = os.write(fd, view)
+        except InterruptedError:
+            continue
+        except BlockingIOError:
+            select.select([], [fd], [])
+            continue
+        view = view[written:]
+
+
 def sanitize_terminal_text(chunk: bytes) -> str:
     text = chunk.decode("utf-8", errors="ignore")
     text = OSC_ESCAPE_RE.sub("", text)
@@ -356,6 +405,19 @@ def title_indicates_prompt(title: str) -> bool:
     return ACTION_REQUIRED_TITLE_RE.search(title) is not None
 
 
+def title_is_busy(title: str) -> bool:
+    """True while Codex is actively working.
+
+    Keyed off the first visible glyph: a braille code point means the spinner is
+    animating. The "[ ! ]" approval marker and the plain idle title both fail this,
+    which is what makes it usable as a "no longer blocked on the user" signal.
+    """
+    for ch in title:
+        if not ch.isspace():
+            return BRAILLE_SPINNER_RANGE[0] <= ord(ch) <= BRAILLE_SPINNER_RANGE[1]
+    return False
+
+
 def prompt_visible(text: str) -> bool:
     """Detect that Codex is blocked on an interactive approval/selection prompt.
 
@@ -367,9 +429,11 @@ def prompt_visible(text: str) -> bool:
     to wording drift.
 
     This complements the "[!] Action Required" terminal-title marker
-    (title_indicates_prompt): the title covers command/patch approvals, while
-    this text match also catches the startup "Do you trust the contents of this
-    directory?" prompt, which appears before Codex emits any terminal title.
+    (title_indicates_prompt): the title covers command/patch approvals, while this
+    text match also catches the menus Codex never marks in the title -- the startup
+    "Do you trust the contents of this directory?" trust prompt and the
+    model-migration / onboarding choices. Both signals are unioned; neither one
+    suppresses the other.
     """
     if not text:
         return False
@@ -439,9 +503,13 @@ class PromptState:
         self.last_activate_at = 0.0
         self.last_notify_at = 0.0
         self.pending_prompt_since = 0.0
+        self.pending_prompt_excerpt = None
         self.last_terminal_title = None
         self.pending_title_clear_since = 0.0
-        self.seen_terminal_title = False
+        self.last_output_at = 0.0
+        self.last_scan_text = None
+        # Drop any state file left behind by a previous run that was killed.
+        self.clear_state()
 
     def debug(self, message: str) -> None:
         if not self.debug_enabled:
@@ -526,9 +594,30 @@ class PromptState:
         self.last_activate_at = 0.0
         self.last_notify_at = 0.0
         self.pending_prompt_since = 0.0
+        self.pending_prompt_excerpt = None
         self.last_terminal_title = None
         self.pending_title_clear_since = 0.0
-        self.seen_terminal_title = False
+        # The prompt is gone as far as we know; forget the screen text so the idle
+        # rescan cannot immediately re-enter on the menu we just finished with.
+        self.last_scan_text = None
+
+    def note_title_busy(self) -> None:
+        # The title spinner started animating again, so Codex resumed working and
+        # is no longer blocked on the user. Drop any pending/active prompt.
+        self.pending_prompt_since = 0.0
+        self.pending_prompt_excerpt = None
+        self.last_scan_text = None
+        if self.active:
+            self.exit()
+
+    def note_output(self, scan_text: str) -> None:
+        self.last_output_at = time.monotonic()
+        self.last_scan_text = scan_text
+
+    def note_user_answered(self) -> None:
+        # A keystroke that answers the menu. Forget the screen text along with the
+        # rolling buffer so neither path re-triggers on the dismissed prompt.
+        self.last_scan_text = None
 
     def mark_prompt_seen(self, excerpt: str) -> None:
         self.last_excerpt = excerpt
@@ -551,6 +640,7 @@ class PromptState:
 
             if self.pending_prompt_since == 0.0:
                 self.pending_prompt_since = now
+                self.pending_prompt_excerpt = excerpt
                 return
 
             if now - self.pending_prompt_since >= PROMPT_ENTER_STABILITY_SECONDS:
@@ -558,10 +648,39 @@ class PromptState:
             return
 
         self.pending_prompt_since = 0.0
+        self.pending_prompt_excerpt = None
+
+    def maybe_enter_pending_prompt(self) -> None:
+        # Promote a prompt that was seen but had not yet held still long enough.
+        # Codex paints a menu once and then goes silent, so without this the
+        # stability wait would never be satisfied for a text-detected prompt.
+        if self.active or self.pending_prompt_since == 0.0:
+            return
+
+        if time.monotonic() - self.pending_prompt_since >= PROMPT_ENTER_STABILITY_SECONDS:
+            self.enter(self.pending_prompt_excerpt or "")
+
+    def maybe_enter_idle_prompt(self) -> None:
+        """Enter from what is still on screen once Codex has stopped painting.
+
+        A static approval prompt emits nothing after it is drawn, so if the chunk
+        that drew it did not produce an entry -- it straddled a read boundary, or a
+        late spinner title cancelled the pending state -- nothing would ever raise
+        the terminal. Re-checking the retained screen text after a quiet moment
+        makes detection level-triggered instead of purely edge-triggered.
+        """
+        if self.active or not self.last_scan_text:
+            return
+        if time.monotonic() - self.last_output_at < PROMPT_IDLE_RESCAN_SECONDS:
+            return
+        if title_is_busy(self.last_terminal_title or ""):
+            return
+        if prompt_visible(self.last_scan_text):
+            self.debug("PROMPT_ENTER_IDLE_RESCAN")
+            self.enter(self.last_scan_text[-500:])
 
     def update_terminal_title(self, title: str) -> None:
         self.last_terminal_title = title
-        self.seen_terminal_title = True
         self.debug(f"TITLE {title}")
 
     def mark_title_prompt_state(self, title_prompt_visible: bool) -> None:
@@ -599,6 +718,10 @@ class PromptState:
 
         if prompt_is_visible:
             self.pending_resolution_until = 0.0
+            return
+
+        if now - self.last_prompt_seen_at >= PROMPT_EXIT_GRACE_SECONDS:
+            self.exit()
 
     def force_activate_terminal(self, now: Optional[float] = None) -> None:
         if not self.activate_enabled or not self.terminal_app:
@@ -620,8 +743,9 @@ class PromptState:
             return
 
         if self.pending_resolution_until > 0.0:
-            if now < self.pending_resolution_until:
-                if now - self.last_prompt_seen_at >= PROMPT_EXIT_GRACE_SECONDS:
+            # current_time, not the optional `now` argument, which may be None.
+            if current_time < self.pending_resolution_until:
+                if current_time - self.last_prompt_seen_at >= PROMPT_EXIT_GRACE_SECONDS:
                     self.exit()
                 return
 
@@ -630,6 +754,8 @@ class PromptState:
     def tick(self) -> None:
         # Called every main-loop iteration, even when no output arrives, so a
         # static permission prompt still gets re-focused and re-notified.
+        self.maybe_enter_pending_prompt()
+        self.maybe_enter_idle_prompt()
         self.perform_pending_restore()
         if not self.active:
             return
@@ -673,6 +799,56 @@ class PromptState:
                 pass
 
 
+def scan_output(state: PromptState, data: bytes, rolling_text: deque) -> None:
+    """Feed one chunk of Codex's output through prompt detection.
+
+    Kept out of main() so the detection path can be replayed against recorded
+    terminal streams (tests/selftest.py) instead of being re-implemented there.
+    """
+    cleaned = sanitize_terminal_text(data)
+    chunk_text_visible = prompt_visible(cleaned) if cleaned else False
+
+    titles = extract_terminal_titles(data)
+    title_prompt_visible = False
+    if titles:
+        latest_title = titles[-1]
+        state.update_terminal_title(latest_title)
+        title_prompt_visible = title_indicates_prompt(latest_title)
+        state.mark_title_prompt_state(title_prompt_visible)
+        if title_is_busy(latest_title) and not chunk_text_visible:
+            # Codex resumed working -> the prompt is resolved. Drop the rolling
+            # buffer so the now-dismissed menu text can't keep matching from
+            # history. A chunk that both animates the spinner and paints a menu is a
+            # prompt arriving, not one resolving, so it is exempt.
+            if state.active or state.pending_prompt_since:
+                rolling_text.clear()
+            state.note_title_busy()
+
+    if not cleaned:
+        if title_prompt_visible:
+            state.maybe_enter_after_output(True, state.last_excerpt or "", True)
+        else:
+            state.maybe_exit_after_title_clear(False)
+        return
+
+    rolling_text.extend(cleaned)
+    scan_text = "".join(rolling_text)[-PROMPT_SCAN_TAIL_CHARS:]
+    text_visible = chunk_text_visible or prompt_visible(scan_text)
+    # Union of the two signals. Codex now sets a terminal title from its first
+    # paint, so gating the text match on "no title seen yet" silently disabled it
+    # for the whole session -- leaving only the marker, which Codex sets for command
+    # and patch approvals but not for its other blocking menus.
+    visible = title_prompt_visible or text_visible
+    excerpt = scan_text[-500:]
+    state.note_output(scan_text)
+    state.maybe_enter_after_output(visible, excerpt, title_prompt_visible)
+    if visible and state.active:
+        state.mark_prompt_seen(excerpt)
+    state.maybe_exit_after_title_clear(text_visible)
+    if not visible:
+        state.maybe_exit_after_output(False)
+
+
 def main() -> int:
     args = parse_args()
     extra_args = clean_args(args.codex_args)
@@ -707,7 +883,7 @@ def main() -> int:
         stdin=slave_fd,
         stdout=slave_fd,
         stderr=slave_fd,
-        preexec_fn=os.setsid,
+        preexec_fn=adopt_controlling_tty,
         close_fds=True,
     )
     os.close(slave_fd)
@@ -719,6 +895,13 @@ def main() -> int:
         del signum, frame
         try:
             set_pty_size(master_fd, terminal_size(stdin_fd))
+        except OSError:
+            pass
+        # Resizing the master signals the pty's foreground process group; signal
+        # the child's group directly as well, so a resize still reaches it even if
+        # adopting the controlling terminal did not take.
+        try:
+            os.killpg(child.pid, signal.SIGWINCH)
         except OSError:
             pass
 
@@ -742,34 +925,8 @@ def main() -> int:
                 if not data:
                     break
 
-                os.write(stdout_fd, data)
-
-                titles = extract_terminal_titles(data)
-                title_prompt_visible = False
-                if titles:
-                    latest_title = titles[-1]
-                    state.update_terminal_title(latest_title)
-                    title_prompt_visible = title_indicates_prompt(latest_title)
-                    state.mark_title_prompt_state(title_prompt_visible)
-
-                cleaned = sanitize_terminal_text(data)
-                if cleaned:
-                    rolling_text.extend(cleaned)
-                    joined = "".join(rolling_text)
-                    scan_text = joined[-PROMPT_SCAN_TAIL_CHARS:]
-                    text_visible = prompt_visible(scan_text)
-                    visible = title_prompt_visible if state.seen_terminal_title else (title_prompt_visible or text_visible)
-                    excerpt = scan_text[-500:]
-                    state.maybe_enter_after_output(visible, excerpt, title_prompt_visible)
-                    if visible and state.active:
-                        state.mark_prompt_seen(excerpt)
-                    state.maybe_exit_after_title_clear(text_visible if not state.seen_terminal_title else False)
-                    if not visible:
-                        state.maybe_exit_after_output(False)
-                elif title_prompt_visible:
-                    state.maybe_enter_after_output(True, state.last_excerpt or "", True)
-                else:
-                    state.maybe_exit_after_title_clear(False)
+                write_all(stdout_fd, data)
+                scan_output(state, data, rolling_text)
 
             if stdin_fd in readable:
                 try:
@@ -778,9 +935,14 @@ def main() -> int:
                     user_input = b""
 
                 if user_input:
-                    os.write(master_fd, user_input)
+                    write_all(master_fd, user_input)
                     if state.active and any(token in user_input for token in PROMPT_CLEAR_ACTION_BYTES):
                         state.mark_resolution_attempt()
+                        # The user answered the prompt. Flush history so the menu
+                        # text that is about to scroll off can't re-trigger a stale
+                        # active state; only genuinely new output counts.
+                        rolling_text.clear()
+                        state.note_user_answered()
 
             state.tick()
     finally:
