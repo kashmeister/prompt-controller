@@ -1,0 +1,103 @@
+%% prompt-controller — logic diagram
+%% Regenerate the PNG with:
+%%   npx -p @mermaid-js/mermaid-cli mmdc -i logic_diagram.mmd -o logic_diagram.png -s 2 -b white
+flowchart TD
+
+  subgraph HIE["Human input enhancement"]
+    direction LR
+    KB["Karabiner map<br/>hold-to-send macros"]
+    PAD["Controller keys<br/>arrows · enter · esc · 1-3"]
+  end
+
+  OP(("Human<br/>operator"))
+  KB -.->|assists| OP
+  PAD -.->|assists| OP
+
+  subgraph PW["Prompt wrappers"]
+    direction TB
+    WRAP["Claude / Codex wrapper<br/>python wrapper"]
+    PTY["PTY bridge<br/>controlling terminal · forwards keys · full writes"]
+    SCAN["scan_output<br/>per-chunk detection"]
+    SAN["Sanitize and buffer<br/>strip ANSI · 2200-char tail"]
+    TXT["Menu matcher<br/>whitespace-insensitive"]
+    TTL["Title watcher<br/>Action Required · braille spinner"]
+    RESCAN["Idle rescan<br/>level trigger on quiet screen"]
+    SM["Prompt state machine<br/>enter · remind · exit"]
+    WINCH["SIGWINCH relay<br/>window resize reaches the CLI"]
+  end
+
+  subgraph RB["Runtime boundary"]
+    direction TB
+    CFG["Flags and env<br/>config"]
+    DBG["Debug file<br/>debug output"]
+    CLI["Claude Code / Codex CLI<br/>agent CLI"]
+    TERM["Terminal app<br/>macOS terminal"]
+    ST["/tmp state<br/>runtime state"]
+    NF["Notify and focus<br/>macOS actions"]
+    RL(("Reminder loop<br/>lifecycle loop"))
+  end
+
+  subgraph VER["Verification"]
+    direction LR
+    FIX["Fixtures<br/>recorded PTY streams"]
+    TEST["selftest.py<br/>replay harness"]
+  end
+
+  %% launch and process setup
+  OP -->|launches| WRAP
+  WRAP -->|reads| CFG
+  WRAP -->|writes| DBG
+  WRAP -->|spawns| PTY
+  PTY -->|runs| CLI
+  CLI -->|renders output| TERM
+
+  %% detection pipeline
+  PTY -->|forwards chunks to| SCAN
+  SCAN -->|feeds| SAN
+  SAN -->|matched by| TXT
+  SAN -->|retained for| RESCAN
+  SCAN -->|titles read by| TTL
+  TXT -->|menu on screen| SM
+  TTL -->|approval title| SM
+  TTL -->|busy again| SM
+  RESCAN -->|prompt still up| SM
+
+  %% reaction
+  SM -->|updates| ST
+  SM -->|triggers| NF
+  NF -->|raises window| TERM
+  RL -->|feeds| NF
+  NF -->|repeats| RL
+
+  %% answering — the keystroke path is shown ending at the pty bridge (which is
+  %% what actually reads stdin) rather than looping terminal->pty, so the graph
+  %% stays acyclic and the runtime block keeps ranking below the wrappers
+  OP -->|answers prompt| TERM
+  PTY -->|keystroke answer clears| SM
+
+  %% resize — drawn forward from the wrapper rather than back from the terminal,
+  %% so the runtime subgraph still ranks below the wrappers
+  WRAP -->|installs| WINCH
+  WINCH -->|resizes pty · signals CLI| PTY
+
+  %% verification — dotted, and hanging below scan_output so it stays clear of
+  %% the launch edge rather than being ranked above the wrappers
+  FIX -.->|replayed by| TEST
+  SCAN -.->|covered by| TEST
+
+  classDef input fill:#d5e8d4,stroke:#2e8b57,stroke-width:2px,color:#1e5f3f
+  classDef human fill:#eef2fa,stroke:#4a6fa5,stroke-width:2px,color:#1a3d6d
+  classDef wrapper fill:#dae8fc,stroke:#6c8ebf,stroke-width:2px,color:#1a3d6d
+  classDef runtime fill:#ffe6cc,stroke:#d79b00,stroke-width:2px,color:#7f3f00
+  classDef verify fill:#e8e0f5,stroke:#7b5aa6,stroke-width:2px,color:#43286b
+
+  class KB,PAD input
+  class OP human
+  class WRAP,PTY,SCAN,SAN,TXT,TTL,RESCAN,SM,WINCH wrapper
+  class CFG,DBG,CLI,TERM,ST,NF,RL runtime
+  class FIX,TEST verify
+
+  style HIE fill:#fafafa,stroke:#d9d9d9,stroke-width:1px,color:#333
+  style PW  fill:#fafafa,stroke:#d9d9d9,stroke-width:1px,color:#333
+  style RB  fill:#fafafa,stroke:#d9d9d9,stroke-width:1px,color:#333
+  style VER fill:#fafafa,stroke:#d9d9d9,stroke-width:1px,color:#333
