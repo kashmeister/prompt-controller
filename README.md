@@ -48,7 +48,7 @@ after updating either CLI, run `python3 tests/selftest.py` (see
 [Checking detection after a CLI update](#checking-detection-after-a-cli-update)).
 
 ```sh
-git clone https://github.com/<you>/prompt-controller.git
+git clone https://github.com/kashmeister/prompt-controller.git
 cd prompt-controller
 ```
 
